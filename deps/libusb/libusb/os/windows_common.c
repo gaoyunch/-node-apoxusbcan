@@ -279,6 +279,7 @@ enum libusb_transfer_status usbd_status_to_libusb_transfer_status(USBD_STATUS st
 	case USBD_STATUS_CANCELED:
 		return LIBUSB_TRANSFER_CANCELLED;
 	case USBD_STATUS_ENDPOINT_HALTED:
+	case USBD_STATUS_STALL_PID:
 		return LIBUSB_TRANSFER_STALL;
 	case USBD_STATUS_DEVICE_GONE:
 		return LIBUSB_TRANSFER_NO_DEVICE;
@@ -331,6 +332,9 @@ static enum windows_version get_windows_version(void)
 	const char *w, *arch;
 	bool ws;
 
+#ifndef ENABLE_LOGGING
+	UNUSED(w); UNUSED(arch);
+#endif
 	memset(&vi, 0, sizeof(vi));
 	vi.dwOSVersionInfoSize = sizeof(vi);
 	if (!GetVersionExA((OSVERSIONINFOA *)&vi)) {
@@ -346,6 +350,8 @@ static enum windows_version get_windows_version(void)
 	if ((vi.dwMajorVersion > 6) || ((vi.dwMajorVersion == 6) && (vi.dwMinorVersion >= 2))) {
 		// Starting with Windows 8.1 Preview, GetVersionEx() does no longer report the actual OS version
 		// See: http://msdn.microsoft.com/en-us/library/windows/desktop/dn302074.aspx
+		// And starting with Windows 10 Preview 2, Windows enforces the use of the application/supportedOS
+		// manifest in order for VerSetConditionMask() to report the ACTUAL OS major and minor...
 
 		major_equal = VerSetConditionMask(0, VER_MAJORVERSION, VER_EQUAL);
 		for (major = vi.dwMajorVersion; major <= 9; major++) {
@@ -381,6 +387,7 @@ static enum windows_version get_windows_version(void)
 
 	ws = (vi.wProductType <= VER_NT_WORKSTATION);
 	version = vi.dwMajorVersion << 4 | vi.dwMinorVersion;
+
 	switch (version) {
 	case 0x50: winver = WINDOWS_2000;  w = "2000"; break;
 	case 0x51: winver = WINDOWS_XP;	   w = "XP";   break;
@@ -390,13 +397,21 @@ static enum windows_version get_windows_version(void)
 	case 0x62: winver = WINDOWS_8;	   w = (ws ? "8" : "2012");	 break;
 	case 0x63: winver = WINDOWS_8_1;   w = (ws ? "8.1" : "2012_R2"); break;
 	case 0x64: // Early Windows 10 Insider Previews and Windows Server 2017 Technical Preview 1 used version 6.4
-	case 0xA0: winver = WINDOWS_10;	   w = (ws ? "10" : "2016");	 break;
+	case 0xA0: winver = WINDOWS_10;	   w = (ws ? "10" : "2016");
+		   if (vi.dwBuildNumber < 20000)
+			   break;
+		   // fallthrough
+	case 0xB0: winver = WINDOWS_11;	   w = (ws ? "11" : "2022");	 break;
 	default:
 		if (version < 0x50)
 			return WINDOWS_UNDEFINED;
-		winver = WINDOWS_11_OR_LATER;
-		w = "11 or later";
+		winver = WINDOWS_12_OR_LATER;
+		w = "12 or later";
 	}
+
+	// We cannot tell if we are on 8, 10, or 11 without "app manifest"
+	if (version == 0x62 && vi.dwBuildNumber == 9200)
+		w = "8 (or later)";
 
 	arch = is_x64() ? "64-bit" : "32-bit";
 
@@ -471,14 +486,15 @@ static unsigned __stdcall windows_iocp_thread(void *arg)
 		usbi_mutex_unlock(&ctx->open_devs_lock);
 
 		if (!found) {
-			usbi_dbg(ctx, "ignoring overlapped %p for handle %p (device %u.%u)",
-				overlapped, dev_handle, dev_handle->dev->bus_number, dev_handle->dev->device_address);
+			usbi_dbg(ctx, "ignoring overlapped %p for handle %p",
+				 overlapped, dev_handle);
 			continue;
 		}
 
-		itransfer = (struct usbi_transfer *)((unsigned char *)transfer_priv + PTR_ALIGN(sizeof(*transfer_priv)));
+		itransfer = TRANSFER_PRIV_TO_USBI_TRANSFER(transfer_priv);
+		struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 		usbi_dbg(ctx, "transfer %p completed, length %lu",
-			 USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer), ULONG_CAST(num_bytes));
+			 transfer, ULONG_CAST(num_bytes));
 		usbi_signal_transfer_completion(itransfer);
 	}
 
@@ -790,8 +806,9 @@ static int windows_handle_transfer_completion(struct usbi_transfer *itransfer)
 	else
 		result = GetLastError();
 
+	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 	usbi_dbg(ctx, "handling transfer %p completion with errcode %lu, length %lu",
-		 USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer), ULONG_CAST(result), ULONG_CAST(bytes_transferred));
+		 transfer, ULONG_CAST(result), ULONG_CAST(bytes_transferred));
 
 	switch (result) {
 	case NO_ERROR:
@@ -837,6 +854,7 @@ static int windows_handle_transfer_completion(struct usbi_transfer *itransfer)
 		return usbi_handle_transfer_completion(itransfer, status);
 }
 
+#ifndef HAVE_CLOCK_GETTIME
 void usbi_get_monotonic_time(struct timespec *tp)
 {
 	static LONG hires_counter_init;
@@ -861,6 +879,7 @@ void usbi_get_monotonic_time(struct timespec *tp)
 	tp->tv_sec = (long)(hires_counter.QuadPart / hires_frequency);
 	tp->tv_nsec = (long)(((hires_counter.QuadPart % hires_frequency) * hires_ticks_to_ps) / UINT64_C(1000));
 }
+#endif
 
 // NB: MSVC6 does not support named initializers.
 const struct usbi_os_backend usbi_backend = {

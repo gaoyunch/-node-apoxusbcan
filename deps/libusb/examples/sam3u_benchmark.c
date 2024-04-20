@@ -122,8 +122,10 @@ static int benchmark_in(uint8_t ep)
 		num_iso_pack = 16;
 
 	xfr = libusb_alloc_transfer(num_iso_pack);
-	if (!xfr)
-		return -ENOMEM;
+	if (!xfr) {
+		errno = ENOMEM;
+		return -1;
+	}
 
 	if (ep == EP_ISO_IN) {
 		libusb_fill_iso_transfer(xfr, devh, ep, buf,
@@ -189,7 +191,7 @@ int main(void)
 	(void)signal(SIGINT, sig_hdlr);
 #endif
 
-	rc = libusb_init(NULL);
+	rc = libusb_init_context(/*ctx=*/NULL, /*options=*/NULL, /*num_options=*/0);
 	if (rc < 0) {
 		fprintf(stderr, "Error initializing libusb: %s\n", libusb_error_name(rc));
 		exit(1);
